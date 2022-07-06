@@ -1,4 +1,4 @@
-use std::{sync::{atomic::{AtomicUsize, AtomicBool, AtomicU64, Ordering::*}, Condvar, Arc}, thread::{JoinHandle, self, Thread}, time::{SystemTime, UNIX_EPOCH, Duration, Instant}};
+use std::{sync::{atomic::{AtomicUsize, AtomicBool, AtomicU64, Ordering::*}, Condvar, Arc}, thread::{JoinHandle, self, Thread}, time::{SystemTime, UNIX_EPOCH, Duration, Instant}, borrow::{BorrowMut, Borrow}, cell::RefCell, rc::Rc};
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::Receiver;
@@ -13,20 +13,11 @@ pub const MILLISECOND_NANOS: u64 = 1000000;
 
 pub struct HashedWheelTimer {
 
-    worker: Arc<Worker>,
+    worker: Arc<Mutex<Worker>>,
     // workerThread: JoinHandle<()>,
-    workerState: WorkerState,
-
-    tickDuration: u128,
-    wheel: Vec<HashedWheelBucket>,
-    mask: u128,
-    startTimeInitialized: Arc<Condvar>,
+    
     sender: Sender<HashedWheelTimeout>,
-    receiver: Receiver<HashedWheelTimeout>,
-    pendingTimeouts: AtomicU64,
-    maxPendingTimeouts: u64,
-
-    startTime: Arc<Mutex<u128>>,
+    
 }
 
 impl HashedWheelTimer {
@@ -35,62 +26,58 @@ impl HashedWheelTimer {
     }
 
     pub fn new(tickDuration: u128, ticksPerWheel: u128, maxPendingTimeouts: u64) -> HashedWheelTimer {
-        let wheel = HashedWheelTimer::createWheel(ticksPerWheel);
-        let worker = Arc::new(Worker::new());
-        let mask = wheel.len() as u128 - 1;
-
         let (sender, receiver) = channel::<HashedWheelTimeout>();
-        
 
+        let worker = Arc::new(Mutex::new(Worker::new(tickDuration, ticksPerWheel, maxPendingTimeouts, receiver)));     
+        
         if INSTANCE_COUNTER.fetch_add(1, Relaxed) > INSTANCE_COUNT_LIMIT 
                 && WARNED_TOO_MANY_INSTANCES.compare_exchange(false, true,Acquire,Relaxed).is_ok() {
             println!("Too may instance");
         }
 
         Self{
-            worker: worker,
-            // workerThread: ,
-            workerState: WorkerState::INIT,
-            tickDuration: tickDuration,
-            wheel: wheel,
-            mask: mask,
-            startTimeInitialized: Arc::new(Condvar::new()),
-            sender: sender,
-            receiver: receiver,
-            pendingTimeouts: AtomicU64::new(1),
-            maxPendingTimeouts: maxPendingTimeouts,
-            startTime: Arc::new(Mutex::new(0)),
+            worker,           
+            sender,            
         }
     }
 
     pub fn start(&self) {
-        match self.workerState {
+        let mut worker = self.worker.lock().unwrap();
+        match worker.workerState {
             WorkerState::INIT => {
-                println!("starting");
-                thread::spawn(move || self.worker.run());
+                worker.workerState = WorkerState::STARTED;
+                let mut startTime = currentTime();
+                if startTime == 0 {
+                    startTime = 1;
+                }
+                worker.startTime = startTime;
+
+                let worker = self.worker.clone();
+                println!("started: {}", startTime);
+                thread::spawn(move || worker.lock().unwrap().run());
             },
-            WorkerState::STARTED => println!("started"),
+            WorkerState::STARTED => {},// println!("started"),
             WorkerState::SHUTDOWN => panic!("cannot be started once stopped"),
         };
-        let startTime = self.startTime.clone();
-        let startTimeInitialized = self.startTimeInitialized.clone();
-        let mut started = startTime.lock().unwrap();
-        while *started == 0 {
-            started = startTimeInitialized.wait(started).unwrap();
+        while worker.startTime == 0 {
+            thread::sleep(Duration::from_millis(1));
+            // started = startTimeInitialized.wait(started).unwrap();
         }
     }
 
-    pub fn newTimeout(&self, task: Arc<dyn FnOnce()>, delay: u128) { // -> HashedWheelTimeout {
-        let pendingTimeoutsCount = self.pendingTimeouts.fetch_add(1, Relaxed);
-        if self.maxPendingTimeouts > 0 && pendingTimeoutsCount > self.maxPendingTimeouts {
-            self.pendingTimeouts.fetch_sub(1, Relaxed);
-            panic!("Number of pending timeouts ({}) is greater than or equal to maximum allowed pending 
-                timeouts ({})", pendingTimeoutsCount, self.maxPendingTimeouts)
+    pub fn newTimeout(&self, task: Box<dyn Fn()>, delay: u128) { // -> HashedWheelTimeout {
+        {
+            let worker = self.worker.lock().unwrap();
+            let pendingTimeoutsCount = worker.pendingTimeouts.fetch_add(1, Relaxed);
+            if worker.maxPendingTimeouts > 0 && pendingTimeoutsCount > worker.maxPendingTimeouts {
+                worker.pendingTimeouts.fetch_sub(1, Relaxed);
+                panic!("Number of pending timeouts ({}) is greater than or equal to maximum allowed pending 
+                    timeouts ({})", pendingTimeoutsCount, worker.maxPendingTimeouts)
+            }
         }
-
         self.start();
 
-        let mut deadline = currentTime() + delay - *self.startTime.lock().unwrap();
+        let mut deadline = currentTime() + delay - self.worker.lock().unwrap().startTime;
 
         // Guard against overflow.
         if delay > 0 && deadline < 0 {
@@ -122,7 +109,17 @@ impl HashedWheelTimer {
 unsafe impl Send for HashedWheelTimer {}
 
 struct Worker {
-    timer: Option<HashedWheelTimer>,
+    workerState: WorkerState,
+
+    tickDuration: u128,
+    wheel: Vec<HashedWheelBucket>,
+    mask: u128,
+    startTimeInitialized: Arc<Condvar>,
+    receiver: Receiver<HashedWheelTimeout>,
+    pendingTimeouts: AtomicU64,
+    maxPendingTimeouts: u64,
+
+    startTime: u128,
     tick: u128,
 }
 
@@ -130,9 +127,21 @@ unsafe impl Send for Worker {}
 unsafe impl Sync for Worker {}
 
 impl Worker {
-    pub fn new() -> Self {
+    pub fn new(tickDuration: u128, ticksPerWheel: u128, maxPendingTimeouts: u64, receiver: Receiver<HashedWheelTimeout>) -> Self {
+        let wheel = HashedWheelTimer::createWheel(ticksPerWheel);
+        
+        let mask = wheel.len() as u128 - 1;
+
         Self {
-            timer: None,
+            workerState: WorkerState::INIT,
+            tickDuration: tickDuration,
+            wheel: wheel,
+            mask: mask,
+            startTimeInitialized: Arc::new(Condvar::new()),
+            receiver: receiver,
+            pendingTimeouts: AtomicU64::new(1),
+            maxPendingTimeouts: maxPendingTimeouts,
+            startTime: 0,
             tick: 0,
         }
     }
@@ -141,59 +150,58 @@ impl Worker {
         
     }
 
-    fn run(&self) {
-        if self.timer.is_none() {
-            thread::sleep(Duration::from_secs(1));
-        }
-        match &self.timer {
-            None => thread::sleep(Duration::from_secs(1)),
-            Some(timer) => {
-                // TODO
-                let mut startTime = currentTime();
-                if startTime == 0 {
-                    startTime = 1;
-                }
-                *timer.startTime.clone().lock().unwrap() = startTime;
-                // Notify the other threads waiting for the initialization at start().
-                let startTimeInitialized = timer.startTimeInitialized.clone();
-                startTimeInitialized.notify_all();
-                while timer.workerState == WorkerState::STARTED {
-                    let deadline = self.waitForNextTick(&timer);
-                    if deadline > 0 {
-                        let idx = self.tick & timer.mask;
-                        // self.processCancelledTasks();
-
-                        let bucket: HashedWheelBucket = timer.wheel[idx as usize];
-                        self.transferTimeoutsToBuckets();
-                        bucket.expireTimeouts(deadline);
-                        self.tick += 1;
-                    }
-                }
-                //TODO: worker stoped, need clear the remain job.
-            },
-        }
+    fn run(&mut self) {
         
+        // let mut startTime = currentTime();
+        // if startTime == 0 {
+        //     startTime = 1;
+        // }
+        // self.startTime = startTime;
+        // Notify the other threads waiting for the initialization at start().
+        // let startTimeInitialized = self.startTimeInitialized.clone();
+        // startTimeInitialized.notify_all();
+        
+        while self.workerState == WorkerState::STARTED {
+            let deadline = self.waitForNextTick();
+            if deadline > 0 {
+                
+                // self.processCancelledTasks();
+                self.transferTimeoutsToBuckets();
+                
+                let idx = self.tick & self.mask;
+                
+                self.wheel[idx as usize].expireTimeouts(deadline);                
+                // bucket.expireTimeouts(deadline);
+                
+                self.tick += 1;
+            }
+        }
+        //TODO: worker stoped, need clear the remain job.      
         
     }
     /**
      * transfer timeouts to buckets every tick.
      */
-    fn transferTimeoutsToBuckets(&self) {
+    fn transferTimeoutsToBuckets(&mut self) {
         // transfer only max. 100000 timeouts per tick to prevent a thread to stale the workerThread when it just
         // adds new timeouts in a loop.
-        let timer = self.timer.unwrap();
         for _ in 0..100000 {
-            let timeout = timer.receiver.recv().unwrap();
-            if timeout.state == TimeoutState::CANCELED {
-                continue;
+            let mut timeout = self.receiver.try_recv();
+            match timeout {
+                Ok(mut timeout) => {
+                    if timeout.state == TimeoutState::CANCELED {
+                        continue;
+                    }
+                    let calculated = timeout.deadline / self.tickDuration;
+                    timeout.remainingRounds = (calculated - self.tick) / self.wheel.len() as u128;
+                    // Ensure we don't schedule for past.
+                    let ticks = calculated.max(self.tick);
+                    let stopIndex = ticks & self.mask;
+                    self.wheel[stopIndex as usize].addTimeout(timeout);
+                },
+                Err(e) => return,
             }
-            let calculated = timeout.deadline / timer.tickDuration;
-            timeout.remainingRounds = (calculated - self.tick) / timer.wheel.len() as u128;
-            // Ensure we don't schedule for past.
-            let ticks = calculated.max(self.tick);
-            let stopIndex = ticks & timer.mask;
-            let bucket: HashedWheelBucket = timer.wheel[stopIndex as usize];
-            bucket.addTimeout(timeout);
+            
         }
     }
 
@@ -203,11 +211,12 @@ impl Worker {
     /// 
     /// @return Long.MIN_VALUE if received a shutdown request,
     /// current time otherwise (with Long.MIN_VALUE changed by +1)
-    fn waitForNextTick(&self, timer: &HashedWheelTimer) -> u128 {
-        let deadline = timer.tickDuration * (self.tick + 1);
+    fn waitForNextTick(&self) -> u128 {
+        let deadline = self.tickDuration * (self.tick + 1);
         loop {
-            let currentTime = currentTime() - *timer.startTime.lock().unwrap();
-            let sleepTimeMs = (deadline - currentTime + 999) / 1000;
+            let mut currentTime = currentTime();
+            currentTime -= self.startTime;
+            let sleepTimeMs = (deadline + 999999 - currentTime) / 1000000;
 
             if sleepTimeMs <= 0 {
                 if currentTime == u128::MAX {
@@ -233,19 +242,19 @@ impl HashedWheelBucket {
         }
     }
 
-    pub fn addTimeout(&self, timeout: HashedWheelTimeout) {
+    pub fn addTimeout(&mut self, timeout: HashedWheelTimeout) {
         self.inner.push(timeout);
     }
 
-    pub fn expireTimeouts(&self, deadline: u128) {
+    pub fn expireTimeouts(&mut self, deadline: u128) {
         let expireds: Vec<HashedWheelTimeout> = self.inner.drain_filter(|e| e.remainingRounds <= 0).collect();
         expireds.iter().for_each(|timeout| timeout.expire());
-        self.inner.iter().for_each(|timeout| timeout.remainingRounds -= 1);
+        self.inner.iter_mut().for_each(|timeout| timeout.remainingRounds -= 1);
     }
 }
 
 struct HashedWheelTimeout {
-    task: Arc<dyn FnOnce()>,
+    task: Box<dyn Fn()>,
     deadline: u128,
     state: TimeoutState,
     // remainingRounds will be calculated and set by Worker.transferTimeoutsToBuckets() before the
@@ -256,7 +265,7 @@ struct HashedWheelTimeout {
 }
 
 impl HashedWheelTimeout {
-    pub fn new(task: Arc<dyn FnOnce()>, deadline: u128) -> Self {
+    pub fn new(task: Box<dyn Fn()>, deadline: u128) -> Self {
         Self {
             state: TimeoutState::INIT,
             task: task,
@@ -266,6 +275,7 @@ impl HashedWheelTimeout {
     }
 
     pub fn expire(&self) {
+        print!("Task running: {}  ", currentTime());
         (self.task)();
     }
 }
