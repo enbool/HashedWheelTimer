@@ -1,5 +1,6 @@
 #![feature(drain_filter)]
 
+pub mod list;
 pub mod HashedWheelTimer;
 
 #[cfg(test)]
